@@ -1,38 +1,13 @@
 """
-Nifty 500 R2 Scanner - V1
+Nifty 500 R2 Scanner engine.
 
-Manual scanner. No database, no scheduler, no Streamlit.
+No database, scheduler, or email.
 
-Logic:
-    x  = (H - L) / 4
-    R1 = C + x
-    R2 = C + 2*x
-    R3 = C + 3*x
-    S1 = C - x
-    S2 = C - 2*x
-    S3 = C - 3*x
+Uses Upstox V3 multi-instrument OHLC:
+- last_price = current price
+- prev_ohlc = previous-session OHLC
 
-Signal:
-    Current Price > R2
-
-Only matching instruments are displayed and exported.
-
-Data:
-    - Nifty 500 constituent list: Nifty Indices
-    - Market data: Upstox V3 OHLC Quotes API
-
-Important:
-    Upstox's V3 OHLC endpoint accepts multiple instrument keys.
-    We therefore fetch the daily quote for up to 500 instruments
-    per API request instead of making one historical request per stock.
-
-For interval=1d, the API response contains:
-    - last_price
-    - prev_ohlc
-    - live_ohlc
-
-The scanner uses prev_ohlc as the previous-session OHLC and
-last_price as the current price.
+Only Current Price > R2 is returned.
 """
 
 from __future__ import annotations
@@ -40,94 +15,25 @@ from __future__ import annotations
 import gzip
 import io
 import json
-import os
 import re
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-from urllib.parse import urljoin
+from typing import Callable, Optional
 
 import pandas as pd
 import requests
-from zoneinfo import ZoneInfo
-
-
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
-IST = ZoneInfo("Asia/Kolkata")
 
 UPSTOX_BASE_URL = "https://api.upstox.com/v3"
-
 NIFTY_500_CSV_URL = (
-    "https://www.niftyindices.com/IndexConstituent/"
-    "ind_nifty500list.csv"
+    "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 )
-
 UPSTOX_INSTRUMENT_MASTER_URL = (
     "https://assets.upstox.com/market-quote/instruments/exchange/"
     "complete.json.gz"
 )
-
-OUTPUT_DIR = Path("output")
 REQUEST_TIMEOUT = 30
 MAX_INSTRUMENTS_PER_REQUEST = 500
 
-# Set to True to save the complete internal scan data.
-# False means only R2 matches are saved.
-SAVE_FULL_SCAN = False
-
-
-# ---------------------------------------------------------------------
-# HTTP
-# ---------------------------------------------------------------------
-
-def get_access_token() -> str:
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
-
-    if not token:
-        raise RuntimeError(
-            "\nUPSTOX_ACCESS_TOKEN is not set.\n\n"
-            "PowerShell:\n"
-            "  $env:UPSTOX_ACCESS_TOKEN='YOUR_ACCESS_TOKEN'\n\n"
-            "Command Prompt:\n"
-            "  set UPSTOX_ACCESS_TOKEN=YOUR_ACCESS_TOKEN\n\n"
-            "Linux/macOS:\n"
-            "  export UPSTOX_ACCESS_TOKEN='YOUR_ACCESS_TOKEN'\n"
-        )
-
-    return token
-
-
-def make_session(token: str) -> requests.Session:
-    session = requests.Session()
-    session.headers.update(
-        {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Nifty500-R2-Scanner/1.0",
-        }
-    )
-    return session
-
-
-# ---------------------------------------------------------------------
-# Nifty 500 universe
-# ---------------------------------------------------------------------
-
-def load_nifty500_symbols() -> pd.DataFrame:
-    """
-    Download the current Nifty 500 constituent CSV.
-
-    Nifty Indices publishes the current Index Constituent file.
-    The exact constituent count can change; we use whatever the
-    official file returns rather than assuming exactly 500 rows.
-    """
-    print("1/5  Loading current Nifty 500 constituents...")
-
-    headers = {
+def _headers():
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/154 Safari/537.36"
@@ -135,158 +41,111 @@ def load_nifty500_symbols() -> pd.DataFrame:
         "Accept": "*/*",
     }
 
-    response = requests.get(
+def load_nifty500_symbols():
+    r = requests.get(
         NIFTY_500_CSV_URL,
-        headers=headers,
+        headers=_headers(),
         timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-
-    # Nifty's CSV can be UTF-8/Latin-1 depending on publication.
+    r.raise_for_status()
     try:
-        text = response.content.decode("utf-8-sig")
+        text = r.content.decode("utf-8-sig")
     except UnicodeDecodeError:
-        text = response.content.decode("latin-1")
-
+        text = r.content.decode("latin-1")
     df = pd.read_csv(io.StringIO(text))
 
-    # Locate Symbol column robustly.
     symbol_col = None
     for col in df.columns:
-        normalized = re.sub(r"[^a-z0-9]", "", str(col).lower())
-        if normalized == "symbol":
+        if re.sub(r"[^a-z0-9]", "", str(col).lower()) == "symbol":
             symbol_col = col
             break
-
     if symbol_col is None:
         raise RuntimeError(
-            f"Could not find 'Symbol' column in Nifty file. "
-            f"Columns received: {list(df.columns)}"
+            f"Could not find Symbol column. Columns: {list(df.columns)}"
         )
 
     df["symbol"] = (
-        df[symbol_col]
-        .astype(str)
-        .str.strip()
-        .str.upper()
+        df[symbol_col].astype(str).str.strip().str.upper()
+    )
+    return (
+        df.loc[
+            df["symbol"].notna()
+            & (df["symbol"] != "")
+            & (df["symbol"] != "NAN"),
+            ["symbol"],
+        ]
+        .drop_duplicates()
+        .reset_index(drop=True)
     )
 
-    df = df[df["symbol"].notna()]
-    df = df[df["symbol"] != ""]
-    df = df[df["symbol"] != "NAN"]
-    df = df.drop_duplicates("symbol").reset_index(drop=True)
-
-    print(f"     Loaded {len(df)} Nifty constituents.")
-    return df[["symbol"]]
-
-
-# ---------------------------------------------------------------------
-# Upstox instrument master
-# ---------------------------------------------------------------------
-
-def load_upstox_equity_instruments() -> dict:
-    print("2/5  Loading Upstox NSE equity instrument master...")
-
-    response = requests.get(
+def load_upstox_equity_instruments():
+    r = requests.get(
         UPSTOX_INSTRUMENT_MASTER_URL,
         timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-
-    raw = response.content
-
+    r.raise_for_status()
+    raw = r.content
     try:
         raw = gzip.decompress(raw)
     except gzip.BadGzipFile:
         pass
 
     data = json.loads(raw.decode("utf-8"))
-
     instruments = {}
 
     for item in data:
         if item.get("segment") != "NSE_EQ":
             continue
-
         if item.get("instrument_type") != "EQ":
             continue
 
         symbol = str(item.get("trading_symbol", "")).strip().upper()
-        instrument_key = item.get("instrument_key")
-
-        if not symbol or not instrument_key:
+        key = item.get("instrument_key")
+        if not symbol or not key:
             continue
 
         instruments[symbol] = {
-            "instrument_key": instrument_key,
+            "instrument_key": key,
             "name": item.get("name", ""),
             "isin": item.get("isin", ""),
         }
 
-    print(f"     Loaded {len(instruments)} NSE equity instruments.")
     return instruments
 
-
-def build_universe(
-    nifty_df: pd.DataFrame,
-    instruments: dict,
-) -> pd.DataFrame:
-
+def build_universe(nifty, instruments):
     rows = []
-    missing = []
-
-    for symbol in nifty_df["symbol"]:
+    for symbol in nifty["symbol"]:
         item = instruments.get(symbol)
-
-        if item is None:
-            missing.append(symbol)
-            continue
-
-        rows.append(
-            {
+        if item:
+            rows.append({
                 "symbol": symbol,
                 "instrument_key": item["instrument_key"],
                 "name": item["name"],
                 "isin": item["isin"],
-            }
-        )
+            })
 
     universe = pd.DataFrame(rows)
-
-    if missing:
-        print(
-            f"     Warning: {len(missing)} Nifty symbols "
-            f"were not found in Upstox NSE_EQ."
-        )
-        if len(missing) <= 30:
-            print("     Missing:", ", ".join(missing))
-
-    print(f"     Mapped to Upstox: {len(universe)} stocks.")
-
     if universe.empty:
-        raise RuntimeError("No Nifty constituents could be mapped to Upstox.")
-
+        raise RuntimeError("No Nifty 500 stocks mapped to Upstox.")
     return universe
 
-
-# ---------------------------------------------------------------------
-# Optimized market data
-# ---------------------------------------------------------------------
+def calculate_levels(high, low, close):
+    x = (high - low) / 4.0
+    return {
+        "r1": close + x,
+        "r2": close + 2.0 * x,
+        "r3": close + 3.0 * x,
+        "s1": close - x,
+        "s2": close - 2.0 * x,
+        "s3": close - 3.0 * x,
+    }
 
 def fetch_daily_quotes(
-    session: requests.Session,
-    instrument_keys: list[str],
-) -> dict:
-    """
-    Fetch daily OHLC + current LTP for multiple instruments.
-
-    Upstox V3 accepts a comma-separated list of instrument keys,
-    with a documented maximum of 500 instruments per request.
-
-    For >500 instruments, we automatically split into batches.
-    """
+    session,
+    instrument_keys,
+    progress_callback: Optional[Callable] = None,
+):
     quotes = {}
-
     total = len(instrument_keys)
 
     for start in range(0, total, MAX_INSTRUMENTS_PER_REQUEST):
@@ -294,329 +153,160 @@ def fetch_daily_quotes(
             start:start + MAX_INSTRUMENTS_PER_REQUEST
         ]
 
-        print(
-            f"     Market-data request "
-            f"{start + 1}-{start + len(batch)} of {total}..."
-        )
+        if progress_callback:
+            percent = min(
+                70,
+                40 + int(((start + len(batch)) / total) * 30),
+            )
+            progress_callback(
+                percent,
+                f"Fetching market data: {start + 1}-"
+                f"{start + len(batch)} of {total}..."
+            )
 
-        params = {
-            "instrument_key": ",".join(batch),
-            "interval": "1d",
-        }
-
-        response = session.get(
+        r = session.get(
             f"{UPSTOX_BASE_URL}/market-quote/ohlc",
-            params=params,
+            params={
+                "instrument_key": ",".join(batch),
+                "interval": "1d",
+            },
             timeout=REQUEST_TIMEOUT,
         )
-
-        if response.status_code != 200:
+        if r.status_code != 200:
             raise RuntimeError(
-                "Upstox OHLC request failed.\n"
-                f"HTTP {response.status_code}\n"
-                f"{response.text[:1000]}"
+                f"Upstox OHLC API failed: HTTP {r.status_code}\n"
+                f"{r.text[:1000]}"
             )
 
-        payload = response.json()
-
+        payload = r.json()
         if payload.get("status") != "success":
-            raise RuntimeError(
-                f"Unexpected Upstox response: {payload}"
-            )
+            raise RuntimeError(f"Unexpected Upstox response: {payload}")
 
         quotes.update(payload.get("data", {}))
 
     return quotes
 
-
-# ---------------------------------------------------------------------
-# R/S calculations
-# ---------------------------------------------------------------------
-
-def calculate_levels(
-    high: float,
-    low: float,
-    close: float,
-) -> dict:
-
-    x = (high - low) / 4.0
-
-    return {
-        "x": x,
-        "r1": close + x,
-        "r2": close + (2.0 * x),
-        "r3": close + (3.0 * x),
-        "s1": close - x,
-        "s2": close - (2.0 * x),
-        "s3": close - (3.0 * x),
-    }
-
-
-def build_scan_dataframe(
-    universe: pd.DataFrame,
-    quotes: dict,
-) -> pd.DataFrame:
+def build_results(universe, quotes):
+    by_key = {}
+    for _, quote in quotes.items():
+        token = quote.get("instrument_token")
+        if token:
+            by_key[token] = quote
 
     rows = []
 
-    # Upstox returns data keys in the form NSE_EQ:SYMBOL.
-    # We primarily use instrument_token from the payload to
-    # match back to the universe's instrument_key.
-    by_instrument_key = {}
-
-    for key, quote in quotes.items():
-        instrument_token = quote.get("instrument_token")
-        if instrument_token:
-            by_instrument_key[instrument_token] = quote
-
     for row in universe.itertuples(index=False):
-
-        quote = by_instrument_key.get(row.instrument_key)
-
+        quote = by_key.get(row.instrument_key)
         if quote is None:
-            # Some responses can use exchange:symbol as the key.
-            # Fall back to constructing that key.
             quote = quotes.get(f"NSE_EQ:{row.symbol}")
-
         if quote is None:
             continue
 
         last_price = quote.get("last_price")
-        prev_ohlc = quote.get("prev_ohlc")
-
-        if last_price is None or not prev_ohlc:
+        prev = quote.get("prev_ohlc")
+        if last_price is None or not prev:
             continue
 
         try:
-            current_price = float(last_price)
-            open_price = float(prev_ohlc["open"])
-            high = float(prev_ohlc["high"])
-            low = float(prev_ohlc["low"])
-            close = float(prev_ohlc["close"])
+            current = float(last_price)
+            open_price = float(prev["open"])
+            high = float(prev["high"])
+            low = float(prev["low"])
+            close = float(prev["close"])
         except (KeyError, TypeError, ValueError):
             continue
 
-        if high <= 0 or low <= 0 or close <= 0:
+        if min(current, open_price, high, low, close) <= 0:
             continue
 
         levels = calculate_levels(high, low, close)
-
         r2 = levels["r2"]
 
-        # THE ONLY SIGNAL FILTER.
-        if current_price <= r2:
+        # ONLY SIGNAL FILTER.
+        if current <= r2:
             continue
 
-        percent_above_r2 = (
-            (current_price - r2) / r2
-        ) * 100.0
+        pct = ((current - r2) / r2) * 100.0
 
-        rows.append(
-            {
-                "Symbol": row.symbol,
-                "Company": row.name,
-                "Open": open_price,
-                "High": high,
-                "Low": low,
-                "Close": close,
-                "R1": levels["r1"],
-                "R2": levels["r2"],
-                "R3": levels["r3"],
-                "S1": levels["s1"],
-                "S2": levels["s2"],
-                "S3": levels["s3"],
-                "Current Price": current_price,
-                "% Above R2": percent_above_r2,
-            }
-        )
+        rows.append({
+            "Symbol": row.symbol,
+            "Company": row.name,
+            "Open": open_price,
+            "High": high,
+            "Low": low,
+            "Close": close,
+            "R1": levels["r1"],
+            "R2": levels["r2"],
+            "R3": levels["r3"],
+            "S1": levels["s1"],
+            "S2": levels["s2"],
+            "S3": levels["s3"],
+            "Current Price": current,
+            "% Above R2": pct,
+        })
 
     result = pd.DataFrame(rows)
-
     if not result.empty:
         result = result.sort_values(
             "% Above R2",
             ascending=False,
         ).reset_index(drop=True)
-
     return result
 
+def scan_nifty500(
+    access_token: str,
+    progress_callback: Optional[Callable] = None,
+):
+    if not access_token:
+        raise ValueError("Upstox access token is empty.")
 
-# ---------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "Nifty500-R2-Scanner/1.0",
+    })
 
-def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if progress_callback:
+        progress_callback(5, "Loading current Nifty 500...")
+    nifty = load_nifty500_symbols()
 
-    output = df.copy()
+    if progress_callback:
+        progress_callback(20, "Loading Upstox instrument master...")
+    instruments = load_upstox_equity_instruments()
 
-    money_columns = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "R1",
-        "R2",
-        "R3",
-        "S1",
-        "S2",
-        "S3",
-        "Current Price",
-    ]
+    if progress_callback:
+        progress_callback(30, "Mapping Nifty 500 to Upstox...")
+    universe = build_universe(nifty, instruments)
 
-    for col in money_columns:
-        output[col] = output[col].map(
-            lambda x: f"{x:.2f}"
+    if progress_callback:
+        progress_callback(
+            40,
+            f"Mapped {len(universe)} stocks. Fetching market data..."
         )
 
-    output["% Above R2"] = output["% Above R2"].map(
-        lambda x: f"{x:.2f}%"
+    quotes = fetch_daily_quotes(
+        session,
+        universe["instrument_key"].tolist(),
+        progress_callback,
     )
 
-    return output
-
-
-def save_results(
-    result: pd.DataFrame,
-    scan_time: datetime,
-) -> Path | None:
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    timestamp = scan_time.strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"r2_scanner_{timestamp}.csv"
-
-    result.to_csv(path, index=False)
-
-    return path
-
-
-def print_results(
-    result: pd.DataFrame,
-    scan_time: datetime,
-    universe_count: int,
-    quote_count: int,
-) -> None:
-
-    print("\n" + "=" * 150)
-    print("NIFTY 500 R2 SCANNER")
-    print("=" * 150)
-    print(
-        f"Scan time:       "
-        f"{scan_time.strftime('%Y-%m-%d %H:%M:%S')} IST"
-    )
-    print(f"Universe:        {universe_count}")
-    print(f"Quotes received: {quote_count}")
-    print(f"Stocks > R2:     {len(result)}")
-    print("=" * 150)
-
-    if result.empty:
-        print("\nNo Nifty 500 stocks are currently above R2.\n")
-        return
-
-    display_columns = [
-        "Symbol",
-        "Close",
-        "R1",
-        "R2",
-        "R3",
-        "S1",
-        "S2",
-        "S3",
-        "Current Price",
-        "% Above R2",
-    ]
-
-    print(
-        format_for_display(
-            result[display_columns]
-        ).to_string(index=False)
-    )
-
-    print("=" * 150)
-
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
-def main() -> int:
-    started = time.perf_counter()
-    scan_time = datetime.now(IST)
-
-    print("\n" + "=" * 80)
-    print("NIFTY 500 R2 SCANNER - V1")
-    print("=" * 80)
-    print(
-        f"Started: {scan_time.strftime('%Y-%m-%d %H:%M:%S')} IST"
-    )
-    print()
-
-    try:
-        token = get_access_token()
-        session = make_session(token)
-
-        # 1. Universe
-        nifty = load_nifty500_symbols()
-
-        # 2. Upstox instrument mapping
-        instruments = load_upstox_equity_instruments()
-        universe = build_universe(nifty, instruments)
-
-        # 3. ONE batched market-data operation (or two if universe > 500)
-        print(
-            "3/5  Fetching previous-session OHLC + current LTP..."
-        )
-        quotes = fetch_daily_quotes(
-            session,
-            universe["instrument_key"].tolist(),
+    if progress_callback:
+        progress_callback(
+            75,
+            "Calculating R/S levels and filtering Current Price > R2...",
         )
 
-        print(f"     Quotes received: {len(quotes)}")
+    results = build_results(universe, quotes)
 
-        # 4. Calculate and filter
-        print("4/5  Calculating R/S levels and filtering LTP > R2...")
-        result = build_scan_dataframe(
-            universe,
-            quotes,
+    if progress_callback:
+        progress_callback(
+            95,
+            f"Found {len(results)} stocks above R2.",
         )
 
-        # 5. Output
-        print("5/5  Displaying results...")
-        print_results(
-            result,
-            scan_time,
-            len(universe),
-            len(quotes),
-        )
-
-        csv_path = save_results(
-            result,
-            scan_time,
-        )
-
-        print(
-            f"\nCSV saved: {csv_path.resolve()}"
-        )
-
-        elapsed = time.perf_counter() - started
-
-        print(
-            f"Total runtime: {elapsed:.2f} seconds"
-        )
-        print("=" * 80)
-
-        return 0
-
-    except requests.RequestException as exc:
-        print(f"\nNetwork error: {exc}", file=sys.stderr)
-        return 1
-
-    except Exception as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return {
+        "results": results,
+        "universe_count": len(universe),
+        "quotes_received": len(quotes),
+    }

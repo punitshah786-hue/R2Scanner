@@ -1,10 +1,10 @@
-# Nifty 500 R2 Scanner — V1
+# Nifty 500 R2 Scanner — Streamlit V1
 
-A lightweight Python scanner for the Nifty 500 using the Upstox API.
+A lightweight Streamlit app that scans the current Nifty 500 using Upstox.
 
-## Strategy
+## Signal
 
-For every Nifty 500 stock, using the previous trading session's OHLC:
+Previous-session OHLC:
 
 ```text
 x  = (H - L) / 4
@@ -18,184 +18,90 @@ S2 = C - 2x
 S3 = C - 3x
 ```
 
-The scanner displays **only** instruments where:
+The **only signal filter** is:
 
 ```text
 Current Price > R2
 ```
 
-It also displays:
+The UI displays only matching stocks and sorts them by `% Above R2`.
 
-- Previous-day OHLC
-- R1, R2, R3
-- S1, S2, S3
-- Current Price
-- % Above R2
-
-Results are sorted by `% Above R2`, highest first.
-
-## Architecture
+## Included files
 
 ```text
-Nifty 500 official constituent list
-            |
-            v
-     Upstox instrument map
-            |
-            v
-   Upstox V3 OHLC Quotes API
-            |
-            +---- previous-session OHLC
-            |
-            +---- current LTP
-            |
-            v
-       R/S calculation
-            |
-            v
-       Current Price > R2
-            |
-            v
-       Terminal + CSV
+app.py
+scanner.py
+requirements.txt
+README.md
+.gitignore
+.streamlit/secrets.toml.example
 ```
 
-There is:
-
-- No database
-- No scheduler
-- No Streamlit
-- No email yet
-
-Run it manually first and validate the scanner.
-
-## Why the OHLC request is optimized
-
-The scanner does **not** make one historical API request per stock.
-
-It uses the Upstox V3 Market Quote OHLC endpoint with multiple instrument keys in a single request.
-
-The API supports comma-separated instrument keys and a maximum of 500 instruments per request. If the Nifty universe contains more than 500 instruments, the code automatically creates additional batches.
-
-For `interval=1d`, the scanner uses the response's `prev_ohlc` as the previous session OHLC and `last_price` as the current price.
-
-This means the normal Nifty 500 scan needs only a very small number of market-data requests instead of ~500 individual requests.
-
-## Requirements
-
-- Python 3.10+
-- Upstox account/API access
-- Upstox access token
-- Internet connection
-
-## Installation
-
-### Windows PowerShell
-
-```powershell
-git clone <YOUR_REPO_URL>
-cd nifty500-r2-scanner
-
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-
-pip install -r requirements.txt
-```
-
-### Linux/macOS
+## Local run
 
 ```bash
-git clone <YOUR_REPO_URL>
-cd nifty500-r2-scanner
-
-python3 -m venv .venv
-source .venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
-## Configure Upstox token
+Set your Upstox token.
 
-Do NOT put your token in `scanner.py`.
-
-### Windows PowerShell
+PowerShell:
 
 ```powershell
 $env:UPSTOX_ACCESS_TOKEN="YOUR_UPSTOX_ACCESS_TOKEN"
 ```
 
-### Windows Command Prompt
-
-```cmd
-set UPSTOX_ACCESS_TOKEN=YOUR_UPSTOX_ACCESS_TOKEN
-```
-
-### Linux/macOS
+Linux/macOS:
 
 ```bash
 export UPSTOX_ACCESS_TOKEN="YOUR_UPSTOX_ACCESS_TOKEN"
 ```
 
-## Run
+Run:
 
 ```bash
-python scanner.py
+streamlit run app.py
 ```
 
-## Output
+## Streamlit Community Cloud
 
-Example:
+1. Push this repository to GitHub.
+2. Create a new Streamlit Community Cloud app.
+3. Select this repository.
+4. Set the main file to `app.py`.
+5. Deploy.
+6. Open App Settings → Secrets.
+7. Add:
 
-```text
-====================================================================================================
-NIFTY 500 R2 SCANNER
-====================================================================================================
-Scan time:       2026-10-03 09:30:01 IST
-Universe:        500
-Quotes received: 500
-Stocks > R2:     6
-====================================================================================================
-Symbol   Close    R1    R2    R3    S1    S2    S3    Current Price   % Above R2
-HFCL     66.20   ...   ...   ...   ...   ...   ...      70.10           2.71%
-...
-====================================================================================================
+```toml
+UPSTOX_ACCESS_TOKEN = "YOUR_UPSTOX_ACCESS_TOKEN"
 ```
 
-A CSV is also created in:
+8. Save and rerun the app.
+9. Click **Run Scanner**.
 
-```text
-output/
-```
+Do not commit the real `.streamlit/secrets.toml`.
 
-## GitHub
+## Optimized market-data calls
 
-The repository intentionally contains no credentials.
+The scanner uses the Upstox V3 multi-instrument OHLC endpoint rather than making one OHLC request per stock.
 
-Do not commit:
+The normal Nifty 500 universe fits into one batch. If the universe exceeds the configured batch size, the code automatically splits it.
 
-- Upstox access tokens
-- client secrets
-- Gmail credentials
-- `.env` files containing secrets
+The scanner uses `prev_ohlc` for previous-session OHLC and `last_price` for the current price.
 
-The included `.gitignore` protects common secret files.
+Before using this for trading decisions, verify a few returned OHLC values against Upstox/NSE because live API response semantics should always be validated.
 
-## Important data note
+## Current scope
 
-The official Nifty Indices constituent list is downloaded at runtime, so the universe is not hard-coded.
+No:
 
-## Next versions
+- database
+- scheduler
+- email
+- historical signal storage
+- backtesting
+- NSE holiday database
+- RS/EMA/volume filters
 
-Potential V2/V3 additions:
-
-1. Gmail alert
-2. Streamlit dashboard
-3. Official NSE holiday calendar
-4. Manual refresh button
-5. R2 breakout ranking
-6. Volume expansion
-7. 20/50/200 EMA
-8. Relative Strength
-9. ATR
-10. Market-regime filter
-11. Historical signal tracking
-12. Backtesting
+Those can be added after V1 is validated.
