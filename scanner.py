@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-import concurrent.futures, gzip, io, json, re, time
+import concurrent.futures, gzip, io, json, os, re, time
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
