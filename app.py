@@ -53,7 +53,7 @@ st.caption("Two panels: stocks above a selectable resistance level, and all stoc
 with st.sidebar:
     st.header("Scanner settings")
     level = st.selectbox("Panel 1: Show stocks above", ["R1", "R2", "R3"], index=1)
-    st.info("Using previous-session OHLC\n\nx = (High − Low) / 4\nR1 = Close + x\nR2 = Close + 2x\nR3 = Close + 3x\nS1 = Close − x\nS2 = Close − 2x\nS3 = Close − 3x")
+    st.info("Using previous-session OHLC")
     run_scan = st.button("🔄 Run / Refresh Scanner", type="primary", use_container_width=True)
     st.write("Source: Upstox · Universe: current Nifty 500")
     st.write("Manual scan · No database or scheduler")
