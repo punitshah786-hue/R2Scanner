@@ -28,3 +28,9 @@ Never commit a real token. The app has no database, scheduler, or email; run man
 
 ## Diagnostics
 The top metrics show Nifty symbols, mapped instruments, quote records received, and usable OHLC rows. Open **Data diagnostics** to see skipped-row reasons and sample quote records. Outside market hours, `last_price` may be the last traded price.
+
+## Historical OHLC fix
+
+Previous-session OHLC is now fetched from Upstox V3 Historical Candle Data:
+`/v3/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}`.
+The app requests a 10-calendar-day window ending today, then selects the latest candle strictly before today's date in IST. This handles weekends and exchange holidays. The bulk market-quote endpoint is used only for current/last price. Historical candles require one API call per instrument, executed with a small thread pool. Data diagnostics include historical candle counts and sample errors.
