@@ -27,6 +27,9 @@ def fmt_prices(df):
     return out
 
 def paged_table(df, prefix, page_size=10):
+    # Streamlit/PyArrow rejects duplicate column names. This can happen when
+    # the selected resistance level is also listed in the common R1/R2/R3 set.
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     if df.empty:
         st.info("No rows to display.")
         return
@@ -104,7 +107,11 @@ if breakouts.empty:
     st.warning(f"No stocks currently satisfy Current Price > {level}. Check Panel 2 and the quote counts to confirm the scan fetched data.")
 else:
     st.success(f"Found {len(breakouts)} stocks above {level}.")
-    paged_table(breakouts[["Symbol","Company","Current Price",level,"% Above Level","R1","R2","R3"]], "breakouts")
+    # De-duplicate the selected resistance column (e.g. R2) from the R1/R2/R3 list.
+    breakout_columns = list(dict.fromkeys(
+        ["Symbol", "Company", "Current Price", level, "% Above Level", "R1", "R2", "R3"]
+    ))
+    paged_table(breakouts[breakout_columns], "breakouts")
     st.download_button(f"Download stocks above {level} CSV", breakouts.to_csv(index=False).encode("utf-8"), f"nifty500_above_{level.lower()}.csv", "text/csv")
 
 st.divider()
