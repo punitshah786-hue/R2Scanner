@@ -34,3 +34,13 @@ The top metrics show Nifty symbols, mapped instruments, quote records received, 
 Previous-session OHLC is now fetched from Upstox V3 Historical Candle Data:
 `/v3/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}`.
 The app requests a 10-calendar-day window ending today, then selects the latest candle strictly before today's date in IST. This handles weekends and exchange holidays. The bulk market-quote endpoint is used only for current/last price. Historical candles require one API call per instrument, executed with a small thread pool. Data diagnostics include historical candle counts and sample errors.
+
+## V4 change: Cloudflare HTTP 429 / Error 1015 protection
+
+Historical candle requests are now sent sequentially with a 1-second delay instead of using a concurrent thread pool. Rate-limited responses use exponential backoff, respect `Retry-After` where available, and trigger an additional cooldown. This reduces request bursts that can lead to Cloudflare Error 1015. It does not bypass provider limits; if rate limiting persists, stop the scan and retry later or contact Upstox support. A full 500-stock history scan may take several minutes.
+
+## V5 change: persistent historical-candle cache
+
+Historical daily candles are cached in `.cache/historical_daily_candles.json`. The scanner reuses the latest cached candle strictly before the current IST date and fetches history only for instruments without a suitable cached candle. Each successful candle is saved immediately so a later HTTP 429 does not lose the earlier progress. The cache is pruned to the latest 14 calendar days and is excluded from Git.
+
+**Hosting note:** this local JSON cache survives reruns and app restarts only if the deployment filesystem persists. Some Streamlit Community Cloud restarts/redeployments may reset local files. If persistence is not retained by the host, the scanner will still work but may fetch candles again after a restart.

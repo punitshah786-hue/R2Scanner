@@ -11,7 +11,70 @@ BASE="https://api.upstox.com/v3"
 NIFTY_URL="https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 MASTER_URL="https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 TIMEOUT=30
+
 IST=ZoneInfo("Asia/Kolkata")
+
+# Historical daily OHLC cache: JSON on disk so it survives Streamlit reruns
+# and app restarts when the hosting filesystem is persistent. Cache key includes
+# instrument key + candle date; stale dates are not used for a different session.
+HISTORY_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+HISTORY_CACHE_FILE = os.path.join(HISTORY_CACHE_DIR, "historical_daily_candles.json")
+HISTORY_CACHE_MAX_AGE_DAYS = 14
+
+
+def load_history_cache():
+    try:
+        with open(HISTORY_CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return payload
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_history_cache(cache):
+    os.makedirs(HISTORY_CACHE_DIR, exist_ok=True)
+    temp_path = HISTORY_CACHE_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, separators=(",", ":"), sort_keys=True)
+    os.replace(temp_path, HISTORY_CACHE_FILE)
+
+
+def cache_key(instrument_key, candle_date):
+    return f"{instrument_key}|{candle_date}"
+
+
+def cached_previous_candle(cache, instrument_key, today):
+    # Reuse the latest cached candle strictly before today.
+    candidates = []
+    prefix = f"{instrument_key}|"
+    for key, candle in cache.items():
+        if not key.startswith(prefix) or not isinstance(candle, dict):
+            continue
+        try:
+            day = datetime.fromisoformat(candle["date"]).date()
+            if day < today:
+                candidates.append((day, candle))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def prune_history_cache(cache, today):
+    # Keep only the latest 14 calendar days of candles to prevent unbounded growth.
+    cutoff = today - timedelta(days=HISTORY_CACHE_MAX_AGE_DAYS)
+    cleaned = {}
+    for key, candle in cache.items():
+        try:
+            day = datetime.fromisoformat(candle["date"]).date()
+            if day >= cutoff and day < today:
+                cleaned[key] = candle
+        except (KeyError, TypeError, ValueError):
+            continue
+    return cleaned
 
 def load_nifty500_symbols():
     r=requests.get(NIFTY_URL,headers={"User-Agent":"Mozilla/5.0","Accept":"*/*"},timeout=TIMEOUT); r.raise_for_status()
@@ -74,49 +137,140 @@ def match_quotes(universe,quotes):
         if q is not None: found[r.instrument_key]=q
     return found
 
-def get_previous_candle(token,key,today,from_date):
-    url=f"{BASE}/historical-candle/{quote(key,safe='|')}/days/1/{today}/{from_date}"
-    s=session_for(token); error=None
-    for attempt in range(3):
-        try:
-            r=s.get(url,timeout=TIMEOUT)
-            if r.status_code==429 or r.status_code>=500:
-                error=f"HTTP {r.status_code}: {r.text[:200]}"
-                if attempt<2: time.sleep(.4*(attempt+1)); continue
-                return None,error
-            if r.status_code!=200: return None,f"HTTP {r.status_code}: {r.text[:250]}"
-            p=r.json()
-            if p.get("status")!="success": return None,f"API status: {p}"
-            candles=(p.get("data") or {}).get("candles") or []; valid=[]
-            for c in candles:
-                try:
-                    dt=datetime.fromisoformat(str(c[0]).replace("Z","+00:00"))
-                    if dt.tzinfo: dt=dt.astimezone(IST)
-                    vals=[float(c[i]) for i in range(1,5)]
-                    if dt.date()<today and min(vals)>0 and vals[1]>=vals[2]:
-                        valid.append((dt.date(),vals))
-                except (ValueError,TypeError,IndexError): pass
-            if not valid: return None,"No candle before today's date"
-            day,v=max(valid,key=lambda x:x[0])
-            return {"date":day.isoformat(),"open":v[0],"high":v[1],"low":v[2],"close":v[3]},None
-        except (requests.RequestException,ValueError) as e:
-            error=str(e)
-            if attempt<2: time.sleep(.4*(attempt+1)); continue
-    return None,error or "Unknown error"
+def get_previous_candle(token, key, today, from_date, max_retries=5):
+    """
+    Fetch one instrument's daily historical candles, retrying transient errors.
+    Cloudflare HTTP 1015/429 is treated as a rate-limit response: respect
+    Retry-After when present and otherwise back off exponentially.
+    """
+    url = f"{BASE}/historical-candle/{quote(key, safe='|')}/days/1/{today}/{from_date}"
+    session = session_for(token)
+    last_error = None
 
-def fetch_history(universe,token,progress_callback=None):
-    today=datetime.now(IST).date(); to_date=today.isoformat(); from_date=(today-timedelta(days=10)).isoformat()
-    result={}; errors={}; total=len(universe)
-    def worker(row): return row.instrument_key,*get_previous_candle(token,row.instrument_key,today,from_date)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futures=[pool.submit(worker,row) for row in universe.itertuples(index=False)]
-        for n,f in enumerate(concurrent.futures.as_completed(futures),1):
-            key,candle,error=f.result()
-            if candle: result[key]=candle
-            elif error: errors[key]=error
-            if progress_callback and (n%10==0 or n==total):
-                progress_callback(min(80,25+int(n/total*55)),f"Historical candles fetched: {n}/{total}; found {len(result)}...")
-    return result,errors,from_date,to_date
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.get(url, timeout=TIMEOUT)
+            if response.status_code == 429 or response.status_code == 1015:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait_seconds = float(retry_after) if retry_after else min(60, 3 * (2 ** attempt))
+                except ValueError:
+                    wait_seconds = min(60, 3 * (2 ** attempt))
+                last_error = f"HTTP {response.status_code} rate limited: {response.text[:250]}"
+                if attempt < max_retries:
+                    time.sleep(wait_seconds)
+                    continue
+                return None, last_error
+
+            if response.status_code >= 500:
+                last_error = f"HTTP {response.status_code}: {response.text[:250]}"
+                if attempt < max_retries:
+                    time.sleep(min(30, 2 ** attempt))
+                    continue
+                return None, last_error
+
+            if response.status_code != 200:
+                return None, f"HTTP {response.status_code}: {response.text[:250]}"
+
+            payload = response.json()
+            if payload.get("status") != "success":
+                return None, f"API status: {payload}"
+
+            candles = (payload.get("data") or {}).get("candles") or []
+            valid = []
+            for candle in candles:
+                try:
+                    dt = datetime.fromisoformat(str(candle[0]).replace("Z", "+00:00"))
+                    if dt.tzinfo:
+                        dt = dt.astimezone(IST)
+                    vals = [float(candle[i]) for i in range(1, 5)]
+                    if dt.date() < today and min(vals) > 0 and vals[1] >= vals[2]:
+                        valid.append((dt.date(), vals))
+                except (ValueError, TypeError, IndexError):
+                    continue
+
+            if not valid:
+                return None, "No candle before today's date"
+            day, values = max(valid, key=lambda item: item[0])
+            return {
+                "date": day.isoformat(),
+                "open": values[0],
+                "high": values[1],
+                "low": values[2],
+                "close": values[3],
+            }, None
+
+        except (requests.RequestException, ValueError) as exc:
+            last_error = str(exc)
+            if attempt < max_retries:
+                time.sleep(min(30, 2 ** attempt))
+                continue
+
+    return None, last_error or "Unknown error"
+
+
+def fetch_history(universe, token, progress_callback=None):
+    """
+    Load previous-session daily candles from local JSON cache when possible.
+    Fetch only instruments without a suitable cached candle, sequentially,
+    and persist each successful result immediately so a later 429 does not
+    discard already-fetched history.
+    """
+    today = datetime.now(IST).date()
+    to_date = today.isoformat()
+    from_date = (today - timedelta(days=10)).isoformat()
+    cache = load_history_cache()
+    cache_hits = 0
+    result = {}
+    errors = {}
+    missing_rows = []
+
+    # Reuse only the latest cached candle dated before today.
+    for row in universe.itertuples(index=False):
+        candle = cached_previous_candle(cache, row.instrument_key, today)
+        if candle:
+            result[row.instrument_key] = candle
+            cache_hits += 1
+        else:
+            missing_rows.append(row)
+
+    total = len(universe)
+    if progress_callback:
+        progress_callback(
+            25,
+            f"Historical cache: {cache_hits} hits; fetching {len(missing_rows)} missing candles...",
+        )
+
+    request_delay_seconds = 1.0
+    for n, row in enumerate(missing_rows, start=1):
+        if n > 1:
+            time.sleep(request_delay_seconds)
+
+        candle, error = get_previous_candle(token, row.instrument_key, today, from_date)
+        if candle:
+            result[row.instrument_key] = candle
+            cache[cache_key(row.instrument_key, candle["date"])] = candle
+            # Save after each success so progress is preserved if a later request is rate-limited.
+            save_history_cache(prune_history_cache(cache, today))
+            cache = load_history_cache()
+        elif error:
+            errors[row.instrument_key] = error
+
+        if progress_callback and (n % 5 == 0 or n == len(missing_rows)):
+            pct = 25 + int(n / max(len(missing_rows), 1) * 55)
+            progress_callback(
+                min(80, pct),
+                f"Historical candles: {cache_hits} cache hits; "
+                f"{n}/{len(missing_rows)} missing instruments checked; "
+                f"{len(result)} total candles available...",
+            )
+
+        if error and ("HTTP 429" in error or "HTTP 1015" in error or "rate limited" in error.lower()):
+            time.sleep(15)
+
+    cache = prune_history_cache(cache, today)
+    save_history_cache(cache)
+    return result, errors, from_date, to_date, cache_hits, len(missing_rows)
 
 def build_all_stocks(universe,live_by_key,history):
     rows=[]; skipped={"missing_current_quote":0,"missing_previous_daily_candle":0,"invalid_current_price":0}
@@ -145,14 +299,14 @@ def scan_nifty500(access_token,progress_callback=None):
     live=fetch_live_quotes(session_for(access_token),universe.instrument_key.tolist(),progress_callback)
     live_by_key=match_quotes(universe,live)
     if progress_callback: progress_callback(25,"Fetching previous-session OHLC from historical-candle API...")
-    history,history_errors,from_date,to_date=fetch_history(universe,access_token,progress_callback)
+    history,history_errors,from_date,to_date,history_cache_hits,history_cache_misses=fetch_history(universe,access_token,progress_callback)
     if progress_callback: progress_callback(85,"Calculating R/S levels...")
     all_stocks,skipped=build_all_stocks(universe,live_by_key,history)
     r2=all_stocks.loc[all_stocks["Current Price"]>all_stocks["R2"]].copy()
     if not r2.empty:
         r2["% Above R2"]=(r2["Current Price"]-r2["R2"])/r2["R2"]*100
         r2=r2.sort_values("% Above R2",ascending=False).reset_index(drop=True)
-    detail={"nifty_symbols_count":len(nifty),"mapped_to_upstox":len(universe),"live_quote_records_returned":len(live),"live_quotes_matched":len(live_by_key),"historical_candles_found":len(history),"historical_candle_errors":len(history_errors),"historical_date_window":{"from_date":from_date,"to_date":to_date},"usable_ohlc_rows":len(all_stocks),"skipped_rows":skipped,"sample_historical_errors":dict(list(history_errors.items())[:10]),"live_quote_response_keys_sample":list(live.keys())[:10]}
+    detail={"nifty_symbols_count":len(nifty),"mapped_to_upstox":len(universe),"live_quote_records_returned":len(live),"live_quotes_matched":len(live_by_key),"historical_candles_found":len(history),"historical_cache_hits":history_cache_hits,"historical_cache_misses":history_cache_misses,"historical_candle_errors":len(history_errors),"historical_cache_hits":history_cache_hits,"historical_cache_misses":history_cache_misses,"historical_date_window":{"from_date":from_date,"to_date":to_date},"usable_ohlc_rows":len(all_stocks),"skipped_rows":skipped,"sample_historical_errors":dict(list(history_errors.items())[:10]),"live_quote_response_keys_sample":list(live.keys())[:10]}
     raw={k:{"instrument_token":v.get("instrument_token"),"last_price":v.get("last_price")} for k,v in list(live.items())[:5]}
     if progress_callback: progress_callback(100,f"Completed: {len(all_stocks)} usable stocks.")
-    return {"all_stocks":all_stocks,"results":r2,"nifty_symbols_count":len(nifty),"universe_count":len(universe),"quotes_received":len(live),"diagnostics":f"Live quotes: {len(live)}; matched: {len(live_by_key)}; historical candles: {len(history)}; usable rows: {len(all_stocks)}.","diagnostics_detail":detail,"raw_quote_samples":raw}
+    return {"all_stocks":all_stocks,"results":r2,"nifty_symbols_count":len(nifty),"universe_count":len(universe),"quotes_received":len(live),"diagnostics":f"Live quotes: {len(live)}; matched: {len(live_by_key)}; historical candles: {len(history)}; cache hits: {history_cache_hits}; fetched/missing: {history_cache_misses}; usable rows: {len(all_stocks)}.","diagnostics_detail":detail,"raw_quote_samples":raw}

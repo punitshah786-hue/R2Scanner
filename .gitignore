@@ -1,1 +1,3 @@
 __pycache__/\n*.py[cod]\n.venv/\nvenv/\n.env\n.streamlit/secrets.toml\n*.csv\n.vscode/\n.idea/\n
+# Local historical OHLC cache (do not commit market-data cache)
+.cache/
